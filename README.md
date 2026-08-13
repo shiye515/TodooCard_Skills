@@ -2,7 +2,7 @@
 
 TodooCard 电子拍立得的开放 Skill。
 
-TodooCard Skills 可用于在 macOS 上准备、校验、探测并发送图片到 TodooCard 电子纸卡片。
+TodooCard Skills 可用于在 macOS 上安全配对、校验、探测并发送图片到 TodooCard 电子纸卡片。
 
 ![TodooCard Skill 头图](assets/todoocard-hero.jpg)
 
@@ -11,6 +11,7 @@ TodooCard Skills 可用于在 macOS 上准备、校验、探测并发送图片�
 - 把 JPG、PNG、HEIC 图片转换为 TodooCard 可用的六色电子纸 payload。
 - 在发送前校验 payload 尺寸、QuickLZ 包装和文件结构。
 - 扫描附近兼容的 BLE 电子纸卡片。
+- 按最新固件协议，通过实体按键开启的 60 秒窗口与 Mac 建立系统配对。
 - 按指定设备 UUID 探测设备。
 - 在用户确认后，将图片发送到指定 TodooCard 设备。
 - 处理屏幕倒装、图片横竖方向异常、颜色渲染检查等问题。
@@ -30,7 +31,7 @@ TodooCard Skills 可用于在 macOS 上准备、校验、探测并发送图片�
 在 Codex 里可以这样说：
 
 ```text
-Use $todoocard-skills to prepare this image for my TodooCard and show me the payload before sending.
+Use $todoocard-skills to securely pair my Mac with this TodooCard, then prepare and verify my image before sending.
 ```
 
 或者直接用中文：
@@ -47,43 +48,53 @@ Use $todoocard-skills to prepare this image for my TodooCard and show me the pay
    scripts/prepare_and_send.sh --list
    ```
 
-2. 选择准确的设备 UUID 后，先探测设备：
+2. 如果设备显示 `secure=yes` 且这台 Mac 尚未配对，先运行配对等待命令：
+
+   ```bash
+   scripts/prepare_and_send.sh --pair --device-id UUID
+   ```
+
+   然后长按设备背面按钮 10 秒；正面灯快闪后，脚本只会在广播确认
+   `pairing=open` 时连接。配对窗口最长 60 秒。如 macOS 弹出系统配对提示，
+   请确认配对。
+
+3. 配对完成后，用同一个准确 UUID 探测设备：
 
    ```bash
    scripts/prepare_and_send.sh --probe --device-id UUID
    ```
 
-3. 只准备和校验图片，不发送到设备：
+4. 只准备和校验图片，不发送到设备：
 
    ```bash
    scripts/prepare_and_send.sh --input /path/image.heic
    ```
 
-4. 确认目标 UUID、图片方向和预览结果都正确后，再显式发送：
+5. 确认目标 UUID、图片方向和预览结果都正确后，再显式发送：
 
    ```bash
    scripts/prepare_and_send.sh --input /path/image.heic --device-id UUID --send
    ```
 
-## 方向修正
+## 固定方向要求
 
-如果屏幕是物理倒装，可以加：
+调用方始终提供正向原图，并把它视为正确方向。TodooCard/T3 528x792（`0x134C`）
+的面板校准由底层 `todoocard-correct` 自动处理，不允许通过
+`--screen-orientation` 覆盖，也不要在上层重复旋转或镜像。
 
-```bash
---screen-orientation rotate-180-then-flip-horizontal
-```
-
-如果只有这张源图是横竖方向不对，可以加：
+如果只有源图横竖方向不对，可以先加：
 
 ```bash
 --rotate-right-90
 ```
 
-建议每台设备单独测试方向，不要在没有验证的情况下把方向修正设为默认。
+源图纠偏完成后，底层标准面板校准仍会自动执行。
 
 ## 安全提醒
 
 - 发送前必须确认准确的设备 UUID，不要只按设备名选择。
+- `--pair` 只允许在实体按键开启的配对窗口内连接；普通 BLE 连接不代表配对成功，必须以加密特征读取成功为准。
+- 新设备配对窗口开启时，`--probe` 和 `--send` 会拒绝运行，避免把配对与传图混在一起。
 - `--send` 是显式开关；发送成功后，卡片画面会被新图片替换。
 - 不建议发送外部来源的 `.bin` 或 `.protocol.qlz` 文件，应始终用本 skill 内置脚本生成并校验。
 - 本地图片和临时 payload 视为隐私文件，不要上传到外部服务。

@@ -6,6 +6,52 @@ private func log(_ message: String) {
     fflush(stdout)
 }
 
+private struct TodooAdvertisement {
+    let manufacturerID: UInt16
+    let screenType: UInt16
+    let capabilityFlags: UInt8
+    let firmwareVersion: UInt8
+
+    var requiresEncryptedGatt: Bool {
+        screenType == 0x134C && firmwareVersion >= 0x8C && (capabilityFlags & 0x01) != 0
+    }
+
+    var pairingWindowOpen: Bool {
+        requiresEncryptedGatt && (capabilityFlags & 0x02) != 0
+    }
+
+    var otaRecoveryMode: Bool {
+        (capabilityFlags & 0x08) != 0
+    }
+}
+
+private func parseTodooAdvertisement(_ data: Data?) -> TodooAdvertisement? {
+    guard let data, data.count >= 7 else { return nil }
+    return TodooAdvertisement(
+        manufacturerID: UInt16(data[0]) | UInt16(data[1]) << 8,
+        screenType: UInt16(data[2]) | UInt16(data[6]) << 8,
+        capabilityFlags: data[3],
+        firmwareVersion: data[4]
+    )
+}
+
+private func advertisementDescription(_ info: TodooAdvertisement?) -> String {
+    guard let info else { return "manufacturer=unknown" }
+    guard info.manufacturerID == 0x5053 else {
+        return String(format: "manufacturer=0x%04X", info.manufacturerID)
+    }
+    return String(
+        format: "manufacturer=0x%04X screen=0x%04X firmware=0x%02X flags=0x%02X secure=%@ pairing=%@ recovery=%@",
+        info.manufacturerID,
+        info.screenType,
+        info.firmwareVersion,
+        info.capabilityFlags,
+        info.requiresEncryptedGatt ? "yes" : "no",
+        info.pairingWindowOpen ? "open" : "closed",
+        info.otaRecoveryMode ? "yes" : "no"
+    )
+}
+
 private enum Command: UInt8 {
     case requestBlockSize = 1
     case requestScreenSize = 2
@@ -35,43 +81,57 @@ private let dataCharacteristicUUIDs = [
     CBUUID(string: "0000FEF2-0000-1000-8000-00805F9B34FB"),
     CBUUID(string: "0000FDF2-0000-1000-8000-00805F9B34FB")
 ]
+private let batteryServiceUUID = CBUUID(string: "180F")
+private let batteryLevelCharacteristicUUID = CBUUID(string: "2A19")
 
 private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private lazy var central = CBCentralManager(delegate: self, queue: queue)
     private let queue = DispatchQueue(label: "com.todoocard.mac-image-transfer")
     private let payloadURL: URL
     private let profile: Profile
-    private let targetName: String?
     private let targetID: UUID?
     private let listOnly: Bool
     private let probeOnly: Bool
+    private let pairOnly: Bool
     private let allowDeviceButton: Bool
     private var seenIDs = Set<UUID>()
     private var payload = Data()
     private var peripheral: CBPeripheral?
+    private var advertisedInfo: TodooAdvertisement?
+    private var imageService: CBService?
     private var controlCharacteristic: CBCharacteristic?
     private var dataCharacteristic: CBCharacteristic?
+    private var batteryCharacteristic: CBCharacteristic?
+    private var secureLinkVerified = false
+    private var pairingSucceeded = false
+    private var pairingWindowHintShown = false
+    private var connectionAttempt = 0
+    private var serviceDiscoveryCompleted = false
+    private var notificationSettled = false
+    private var notificationSettleScheduled = false
+    private var transferStarted = false
     private var blockPayloadSize = 0
     private var nextCompressedBlockIndex: Int?
     private var lastProgress = -1
     private var finalAckTimer: DispatchSourceTimer?
     private var controlResponseTimer: DispatchSourceTimer?
+    private var controlFallbackTimer: DispatchSourceTimer?
     private var lastControlCommand: UInt8?
     private var retriedControlWithoutResponse = false
 
-    init(payloadURL: URL, profile: Profile, targetName: String?, targetID: UUID?, listOnly: Bool, probeOnly: Bool, allowDeviceButton: Bool) {
+    init(payloadURL: URL, profile: Profile, targetID: UUID?, listOnly: Bool, probeOnly: Bool, pairOnly: Bool, allowDeviceButton: Bool) {
         self.payloadURL = payloadURL
         self.profile = profile
-        self.targetName = targetName
         self.targetID = targetID
         self.listOnly = listOnly
         self.probeOnly = probeOnly
+        self.pairOnly = pairOnly
         self.allowDeviceButton = allowDeviceButton
         super.init()
     }
 
     func run() {
-        if !listOnly, !probeOnly {
+        if !listOnly, !probeOnly, !pairOnly {
             do {
                 payload = try Data(contentsOf: payloadURL)
             } catch {
@@ -94,15 +154,23 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
         if listOnly {
             log("Scanning nearby BLE devices for 30s ...")
             queue.asyncAfter(deadline: .now() + .seconds(30)) { Foundation.exit(0) }
+        } else if pairOnly {
+            log("Waiting for the physical pairing window on the exact target UUID ...")
+            log("Hold the device's rear button for 10 seconds, until the front light fast-flashes.")
         } else if probeOnly {
             log("Scanning for probe target ...")
         } else {
             log("Scanning for image-transfer device ...")
         }
         if !listOnly {
-            queue.asyncAfter(deadline: .now() + .seconds(45)) { [weak self] in
+            let scanTimeout = pairOnly ? 75 : 45
+            queue.asyncAfter(deadline: .now() + .seconds(scanTimeout)) { [weak self] in
                 guard let self, self.peripheral == nil else { return }
-                log("Timed out scanning for target")
+                if self.pairOnly {
+                    log("Timed out waiting for the 60-second physical pairing window")
+                } else {
+                    log("Timed out scanning for target")
+                }
                 Foundation.exit(14)
             }
         }
@@ -119,49 +187,149 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
     ) {
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = advertisedName ?? peripheral.name ?? ""
+        let advertisement = parseTodooAdvertisement(
+            advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
+        )
         if listOnly {
             guard !seenIDs.contains(peripheral.identifier) else { return }
             seenIDs.insert(peripheral.identifier)
             let services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?
                 .map(\.uuidString)
                 .joined(separator: ",") ?? ""
-            log("BLE \(name.isEmpty ? "(no name)" : name) id=\(peripheral.identifier) RSSI=\(RSSI) services=\(services)")
+            log("BLE \(name.isEmpty ? "(no name)" : name) id=\(peripheral.identifier) RSSI=\(RSSI) services=\(services) \(advertisementDescription(advertisement))")
             return
         }
 
         if let targetID, peripheral.identifier != targetID { return }
-        if let targetName, !name.localizedCaseInsensitiveContains(targetName) { return }
-        if targetID == nil, targetName == nil {
-            let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
-            let lowered = name.lowercased()
-            let hasImageService = advertisedServices.contains { serviceUUIDs.contains($0) }
-            guard hasImageService || lowered.contains("todoocard") || lowered.contains("potatocard") || lowered.hasPrefix("nemr") else { return }
+
+        guard let advertisement else {
+            log("TodooCard manufacturer data is missing")
+            Foundation.exit(20)
+        }
+        guard advertisement.manufacturerID == 0x5053,
+              advertisement.screenType == 0x134C else {
+            log("TodooCard identity mismatch: \(advertisementDescription(advertisement))")
+            Foundation.exit(20)
+        }
+        if pairOnly {
+            guard advertisement.requiresEncryptedGatt else {
+                log("Target firmware does not use the latest secure pairing protocol")
+                Foundation.exit(21)
+            }
+            guard advertisement.pairingWindowOpen else {
+                if !pairingWindowHintShown {
+                    pairingWindowHintShown = true
+                    log("Target found, but pairing=closed; keep holding the rear button until the light fast-flashes.")
+                }
+                return
+            }
+            log("Physical pairing window detected; starting encrypted system pairing.")
+        } else if advertisement.pairingWindowOpen {
+            log("Refusing probe/transfer while the new-device pairing window is open; use --pair for a new Mac or wait for the window to close.")
+            Foundation.exit(26)
         }
 
+        advertisedInfo = advertisement
+        log("Advertisement verified: \(advertisementDescription(advertisement))")
         log("Found \(name.isEmpty ? peripheral.identifier.uuidString : name) id=\(peripheral.identifier) RSSI=\(RSSI)")
         self.peripheral = peripheral
         central.stopScan()
         peripheral.delegate = self
+        connect(peripheral)
+    }
+
+    private func connect(_ peripheral: CBPeripheral) {
+        connectionAttempt += 1
+        let attempt = connectionAttempt
+        log("Connecting (attempt \(attempt)/3) ...")
         central.connect(peripheral, options: nil)
         queue.asyncAfter(deadline: .now() + .seconds(15)) { [weak self, weak peripheral] in
-            guard let self, let peripheral, self.peripheral === peripheral, peripheral.state != .connected else { return }
+            guard let self, let peripheral,
+                  self.peripheral === peripheral,
+                  self.connectionAttempt == attempt,
+                  peripheral.state != .connected else { return }
             log("Timed out connecting")
             Foundation.exit(15)
         }
     }
 
+    private func retryEncryptionTimeout(_ peripheral: CBPeripheral, error: Error?) -> Bool {
+        let systemError = error as NSError?
+        guard advertisedInfo?.requiresEncryptedGatt == true,
+              !secureLinkVerified,
+              systemError?.domain == "CBErrorDomain",
+              systemError?.code == 15,
+              connectionAttempt < 3 else { return false }
+
+        let delay = connectionAttempt == 1 ? 0.75 : 1.5
+        imageService = nil
+        controlCharacteristic = nil
+        dataCharacteristic = nil
+        batteryCharacteristic = nil
+        log("Encryption timed out; retrying the same explicit connection in \(delay)s.")
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak peripheral] in
+            guard let self, let peripheral,
+                  self.peripheral === peripheral,
+                  peripheral.state == .disconnected else { return }
+            self.connect(peripheral)
+        }
+        return true
+    }
+
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         log("Connected")
-        peripheral.discoverServices(probeOnly ? nil : serviceUUIDs)
+        serviceDiscoveryCompleted = false
+        notificationSettled = false
+        notificationSettleScheduled = false
+        peripheral.discoverServices(nil)
+        for delay in [3, 8] {
+            queue.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self, weak peripheral] in
+                guard let self, let peripheral,
+                      self.peripheral === peripheral,
+                      peripheral.state == .connected,
+                      !self.serviceDiscoveryCompleted else { return }
+                log("Service discovery has not completed; retrying")
+                peripheral.discoverServices(nil)
+            }
+        }
+        if pairOnly {
+            queue.asyncAfter(deadline: .now() + .seconds(30)) { [weak self, weak peripheral] in
+                guard let self, let peripheral,
+                      self.peripheral === peripheral,
+                      !self.pairingSucceeded else { return }
+                log("Timed out completing encrypted system pairing")
+                self.central.cancelPeripheralConnection(peripheral)
+                Foundation.exit(27)
+            }
+        } else {
+            queue.asyncAfter(deadline: .now() + .seconds(35)) { [weak self, weak peripheral] in
+                guard let self, let peripheral,
+                      self.peripheral === peripheral,
+                      !self.transferStarted else { return }
+                log("Timed out preparing the verified TodooCard GATT connection")
+                self.central.cancelPeripheralConnection(peripheral)
+                Foundation.exit(19)
+            }
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        if retryEncryptionTimeout(peripheral, error: error) { return }
         log("Connect failed: \(error?.localizedDescription ?? "unknown")")
         Foundation.exit(3)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         log("Disconnected: \(error?.localizedDescription ?? "no error")")
+        if retryEncryptionTimeout(peripheral, error: error) { return }
+        if pairOnly, !pairingSucceeded {
+            log("Pairing did not complete; reopen the physical pairing window and try again.")
+            Foundation.exit(27)
+        }
+        if advertisedInfo?.requiresEncryptedGatt == true, !secureLinkVerified {
+            log("The secure bond is unavailable. Run --pair during a new physical pairing window, then probe again.")
+            Foundation.exit(18)
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -169,20 +337,43 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
             log("Discover services failed: \(error)")
             Foundation.exit(4)
         }
+        serviceDiscoveryCompleted = true
         guard let services = peripheral.services, !services.isEmpty else {
             log("Image-transfer service not found")
             Foundation.exit(5)
         }
-        services.forEach { peripheral.discoverCharacteristics(nil, for: $0) }
+        log("Services ready: \(services.map(\.uuid.uuidString).joined(separator: ","))")
+        imageService = services.first { serviceUUIDs.contains($0.uuid) }
+
+        if advertisedInfo?.requiresEncryptedGatt == true, !secureLinkVerified {
+            guard let batteryService = services.first(where: { $0.uuid == batteryServiceUUID }) else {
+                log("Encrypted Battery Service is missing; cannot verify the secure bond")
+                Foundation.exit(18)
+            }
+            peripheral.discoverCharacteristics(
+                [batteryLevelCharacteristicUUID],
+                for: batteryService
+            )
+            return
+        }
+
+        guard let imageService else {
+            log("Image-transfer service not found after secure pairing")
+            Foundation.exit(5)
+        }
+        peripheral.discoverCharacteristics(
+            controlCharacteristicUUIDs + dataCharacteristicUUIDs,
+            for: imageService
+        )
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error {
-            log("Discover characteristics failed: \(error)")
+            log("Discover characteristics failed for \(service.uuid.uuidString): \(error)")
             Foundation.exit(6)
         }
         service.characteristics?.forEach { characteristic in
-            if probeOnly {
+            if probeOnly || pairOnly {
                 log("Characteristic service=\(service.uuid.uuidString) uuid=\(characteristic.uuid.uuidString) props=\(Self.propertiesDescription(characteristic.properties))")
             }
             if controlCharacteristicUUIDs.contains(characteristic.uuid) {
@@ -192,9 +383,29 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
                 }
             } else if dataCharacteristicUUIDs.contains(characteristic.uuid) {
                 dataCharacteristic = characteristic
+            } else if characteristic.uuid == batteryLevelCharacteristicUUID {
+                batteryCharacteristic = characteristic
             }
         }
-        if probeOnly, service == peripheral.services?.last {
+
+        if service.uuid == batteryServiceUUID {
+            guard let batteryCharacteristic else {
+                log("Encrypted Battery Level characteristic is missing")
+                Foundation.exit(18)
+            }
+            log(pairOnly
+                ? "Requesting encrypted Battery Level to create and verify the system bond ..."
+                : "Verifying the existing encrypted system bond ...")
+            peripheral.readValue(for: batteryCharacteristic)
+            return
+        }
+
+        if probeOnly,
+           controlCharacteristic != nil,
+           dataCharacteristic != nil,
+           (advertisedInfo?.requiresEncryptedGatt != true || secureLinkVerified) {
+            transferStarted = true
+            log("Probe completed: exact UUID, manufacturer=0x5053, screen=0x134C, and secure FEF1/FEF2 access verified")
             Foundation.exit(0)
         }
         beginIfReady()
@@ -205,10 +416,49 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
             log("Enable notify failed: \(error)")
             Foundation.exit(7)
         }
-        beginIfReady()
+        guard !notificationSettleScheduled else { return }
+        notificationSettleScheduled = true
+        log("Control notification enabled; settling for 400ms")
+        queue.asyncAfter(deadline: .now() + .milliseconds(400)) { [weak self] in
+            guard let self else { return }
+            self.notificationSettled = true
+            self.beginIfReady()
+        }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == batteryLevelCharacteristicUUID {
+            if let error {
+                log("Encrypted pairing verification failed: \(error)")
+                Foundation.exit(pairOnly ? 27 : 18)
+            }
+            guard let data = characteristic.value, data.count == 1 else {
+                log("Encrypted Battery Level returned an invalid value")
+                Foundation.exit(pairOnly ? 27 : 18)
+            }
+            secureLinkVerified = true
+            log("Encrypted link verified; battery=\(data[0])%")
+            if pairOnly {
+                pairingSucceeded = true
+                log("Pairing completed. The macOS system bond is ready for a separate --probe.")
+                Foundation.exit(0)
+            }
+            log("Encrypted link ready; allowing 1.8s for Service Changed cache refresh")
+            imageService = nil
+            controlCharacteristic = nil
+            dataCharacteristic = nil
+            notificationSettled = false
+            notificationSettleScheduled = false
+            serviceDiscoveryCompleted = false
+            queue.asyncAfter(deadline: .now() + .milliseconds(1800)) { [weak self, weak peripheral] in
+                guard let self, let peripheral,
+                      self.peripheral === peripheral,
+                      peripheral.state == .connected else { return }
+                log("Rediscovering transfer services after secure cache refresh")
+                peripheral.discoverServices(nil)
+            }
+            return
+        }
         if let error {
             log("Notification failed: \(error)")
             Foundation.exit(8)
@@ -233,8 +483,11 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
 
     private func beginIfReady() {
         guard peripheral != nil, let controlCharacteristic, dataCharacteristic != nil else { return }
+        guard advertisedInfo?.requiresEncryptedGatt != true || secureLinkVerified else { return }
+        guard !transferStarted else { return }
         let waits = controlCharacteristic.properties.contains(.notify) || controlCharacteristic.properties.contains(.indicate)
-        guard !waits || controlCharacteristic.isNotifying else { return }
+        guard !waits || (controlCharacteristic.isNotifying && notificationSettled) else { return }
+        transferStarted = true
         log("Characteristics ready: control=\(controlCharacteristic.uuid.uuidString), data=\(dataCharacteristic?.uuid.uuidString ?? "")")
         log("Control props: \(Self.propertiesDescription(controlCharacteristic.properties))")
         if let dataCharacteristic {
@@ -245,9 +498,16 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
 
     private func writeCommand(_ data: Data) {
         guard let peripheral, let controlCharacteristic else { return }
-        let type: CBCharacteristicWriteType = controlCharacteristic.properties.contains(.write) ? .withResponse : .withoutResponse
+        // Native CoreBluetooth provides a definitive ATT result for
+        // withResponse. If that path stalls, the 600ms fallback below retries
+        // the same command withoutResponse, matching the current App flow.
+        let type: CBCharacteristicWriteType = controlCharacteristic.properties.contains(.write)
+            ? .withResponse
+            : .withoutResponse
         lastControlCommand = data.first
+        retriedControlWithoutResponse = false
         startControlResponseTimer(command: data.first, originalData: data, writeType: type)
+        startControlFallbackTimer(command: data.first, originalData: data)
         log("Control -> \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
         peripheral.writeValue(data, for: controlCharacteristic, type: type)
     }
@@ -260,6 +520,8 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
         }
         controlResponseTimer?.cancel()
         controlResponseTimer = nil
+        controlFallbackTimer?.cancel()
+        controlFallbackTimer = nil
         retriedControlWithoutResponse = false
         log("Control <- \(bytes.map { String(format: "%02x", $0) }.joined(separator: " "))")
         switch command {
@@ -403,6 +665,28 @@ private final class MacImageTransfer: NSObject, CBCentralManagerDelegate, CBPeri
         timer.resume()
     }
 
+    private func startControlFallbackTimer(command: UInt8?, originalData: Data) {
+        controlFallbackTimer?.cancel()
+        guard let command,
+              let controlCharacteristic,
+              controlCharacteristic.properties.contains(.writeWithoutResponse) else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(600))
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.lastControlCommand == command,
+                  self.controlResponseTimer != nil,
+                  !self.retriedControlWithoutResponse,
+                  let peripheral = self.peripheral,
+                  let controlCharacteristic = self.controlCharacteristic else { return }
+            self.retriedControlWithoutResponse = true
+            log("Control reply pending; retrying after 600ms withoutResponse")
+            peripheral.writeValue(originalData, for: controlCharacteristic, type: .withoutResponse)
+        }
+        controlFallbackTimer = timer
+        timer.resume()
+    }
+
     private static func propertiesDescription(_ properties: CBCharacteristicProperties) -> String {
         var values: [String] = []
         if properties.contains(.broadcast) { values.append("broadcast") }
@@ -419,19 +703,20 @@ private func usage() -> Never {
     log("""
     Usage:
       MacImageTransfer --list
-      MacImageTransfer --probe [--name TodooCard] [--id UUID]
-      MacImageTransfer --payload /path/final-180.protocol.qlz --compressed [--name TodooCard] [--id UUID]
-      MacImageTransfer --payload /path/file.bin --standard [--name PotatoCard] [--id UUID]
+      MacImageTransfer --pair --id UUID
+      MacImageTransfer --probe --id UUID
+      MacImageTransfer --payload /path/final-180.protocol.qlz --compressed --id UUID
+      MacImageTransfer --payload /path/file.bin --standard --id UUID
     """)
     Foundation.exit(64)
 }
 
 private var payloadPath: String?
 private var profile: Profile = .compressed
-private var targetName: String?
 private var targetID: UUID?
 private var listOnly = false
 private var probeOnly = false
+private var pairOnly = false
 private var allowDeviceButton = false
 private var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
@@ -441,6 +726,8 @@ while !args.isEmpty {
         listOnly = true
     case "--probe":
         probeOnly = true
+    case "--pair":
+        pairOnly = true
     case "--payload":
         guard !args.isEmpty else { usage() }
         payloadPath = args.removeFirst()
@@ -448,9 +735,6 @@ while !args.isEmpty {
         profile = .compressed
     case "--standard":
         profile = .standard
-    case "--name":
-        guard !args.isEmpty else { usage() }
-        targetName = args.removeFirst()
     case "--id":
         guard !args.isEmpty, let uuid = UUID(uuidString: args.removeFirst()) else { usage() }
         targetID = uuid
@@ -462,15 +746,21 @@ while !args.isEmpty {
 }
 
 let payloadURL = URL(fileURLWithPath: payloadPath ?? "/dev/null")
-if !listOnly, !probeOnly, payloadPath == nil {
+if (listOnly ? 1 : 0) + (probeOnly ? 1 : 0) + (pairOnly ? 1 : 0) > 1 {
+    usage()
+}
+if !listOnly, !probeOnly, !pairOnly, payloadPath == nil {
+    usage()
+}
+if !listOnly, targetID == nil {
     usage()
 }
 MacImageTransfer(
     payloadURL: payloadURL,
     profile: profile,
-    targetName: targetName,
     targetID: targetID,
     listOnly: listOnly,
     probeOnly: probeOnly,
+    pairOnly: pairOnly,
     allowDeviceButton: allowDeviceButton
 ).run()

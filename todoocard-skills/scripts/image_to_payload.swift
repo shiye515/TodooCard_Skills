@@ -28,6 +28,8 @@ private enum Target: String {
 }
 
 private enum Orientation: String {
+    case todooCardCorrect = "todoocard-correct"
+    case rotate180 = "rotate-180"
     case rotate180ThenFlipHorizontal = "rotate-180-then-flip-horizontal"
     case normal
 }
@@ -61,8 +63,8 @@ private func usage() -> Never {
       image_to_payload --input image.jpg --target old-800x480 --output-prefix /tmp/final
 
     Orientation:
-      Images use normal orientation by default.
-      Add --orientation rotate-180-then-flip-horizontal for an inverted screen.
+      TodooCard/T3 528x792 output is hard-required to use todoocard-correct.
+      Supply an upright source image; panel calibration is internal.
 
     Outputs:
       <prefix>.bin
@@ -276,7 +278,7 @@ private func quickLZStoredPayload(from rawData: Data) throws -> Data {
 private var inputPath: String?
 private var target = Target.t3
 private var outputPrefix: String?
-private var orientation = Orientation.normal
+private var orientation = Orientation.todooCardCorrect
 private var args = Array(CommandLine.arguments.dropFirst())
 
 while !args.isEmpty {
@@ -300,6 +302,10 @@ while !args.isEmpty {
 }
 
 guard let inputPath, let outputPrefix else { usage() }
+if target.isT3, orientation != .todooCardCorrect {
+    log("TodooCard/T3 528x792 output requires --orientation todoocard-correct; all raw transform overrides are forbidden.")
+    Foundation.exit(64)
+}
 
 do {
     let size = target.size
@@ -309,6 +315,12 @@ do {
     log("Color mode: six-color Floyd-Steinberg dithering")
     let bitmap: Data
     switch orientation {
+    case .todooCardCorrect:
+        // Canonical T3 panel calibration. Callers provide an upright image and
+        // must not reproduce or compensate for this implementation detail.
+        bitmap = flippedHorizontally(rotated180(unrotatedBitmap, size: size), size: size)
+    case .rotate180:
+        bitmap = rotated180(unrotatedBitmap, size: size)
     case .rotate180ThenFlipHorizontal:
         bitmap = flippedHorizontally(rotated180(unrotatedBitmap, size: size), size: size)
     case .normal:

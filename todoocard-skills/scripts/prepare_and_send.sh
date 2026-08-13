@@ -4,20 +4,23 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 input_path=""
 device_id=""
-screen_orientation="normal"
 rotate_right_90=false
 mode="prepare"
+operation_count=0
 
 usage() {
   cat <<'EOF'
 Usage:
   prepare_and_send.sh --list
+  prepare_and_send.sh --pair --device-id UUID
   prepare_and_send.sh --probe --device-id UUID
-  prepare_and_send.sh --input photo.jpg [--screen-orientation normal|rotate-180-then-flip-horizontal] [--rotate-right-90]
-  prepare_and_send.sh --input photo.jpg --device-id UUID --send [--screen-orientation normal|rotate-180-then-flip-horizontal] [--rotate-right-90]
+  prepare_and_send.sh --input photo.jpg [--rotate-right-90]
+  prepare_and_send.sh --input photo.jpg --device-id UUID --send [--rotate-right-90]
 
 Default behavior only prepares and validates a T3 payload. --send is required
-before Bluetooth writes. --device-id is always required for a probe or send.
+before Bluetooth writes. --device-id is always required for pair, probe, or send.
+Supply an upright source image. TodooCard/T3 528x792 panel calibration is
+applied internally as the fixed todoocard-correct orientation.
 EOF
   exit 64
 }
@@ -26,25 +29,27 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --input) [[ $# -ge 2 ]] || usage; input_path="$2"; shift 2 ;;
     --device-id) [[ $# -ge 2 ]] || usage; device_id="$2"; shift 2 ;;
-    --screen-orientation) [[ $# -ge 2 ]] || usage; screen_orientation="$2"; shift 2 ;;
+    --screen-orientation) echo "TodooCard/T3 orientation is fixed at todoocard-correct and cannot be overridden." >&2; exit 64 ;;
     --rotate-right-90) rotate_right_90=true; shift ;;
-    --list) mode="list"; shift ;;
-    --probe) mode="probe"; shift ;;
-    --send) mode="send"; shift ;;
+    --list) mode="list"; operation_count=$((operation_count + 1)); shift ;;
+    --pair) mode="pair"; operation_count=$((operation_count + 1)); shift ;;
+    --probe) mode="probe"; operation_count=$((operation_count + 1)); shift ;;
+    --send) mode="send"; operation_count=$((operation_count + 1)); shift ;;
     *) usage ;;
   esac
 done
 
-case "$screen_orientation" in
-  normal|rotate-180-then-flip-horizontal) ;;
-  *) echo "Unsupported screen orientation: $screen_orientation" >&2; exit 64 ;;
-esac
+(( operation_count <= 1 )) || usage
 
-for command in swiftc python3 /usr/bin/sips; do
+required_commands=(swiftc)
+if [[ "$mode" == "prepare" || "$mode" == "send" ]]; then
+  required_commands+=(python3 /usr/bin/sips)
+fi
+for command in "${required_commands[@]}"; do
   command -v "$command" >/dev/null 2>&1 || { echo "Required command unavailable: $command" >&2; exit 69; }
 done
 
-if [[ "$mode" == "probe" || "$mode" == "send" ]]; then
+if [[ "$mode" == "pair" || "$mode" == "probe" || "$mode" == "send" ]]; then
   [[ -n "$device_id" ]] || { echo "--device-id is required before contacting a device." >&2; exit 64; }
 fi
 if [[ "$mode" == "prepare" || "$mode" == "send" ]]; then
@@ -60,13 +65,15 @@ fi
 run_dir="$(mktemp -d /tmp/potatocard-transfer.XXXXXX)"
 mkdir -p "$run_dir/module-cache"
 cp -R "$script_dir" "$run_dir/scripts"
-converter="$run_dir/image-to-payload"
 sender="$run_dir/mac-image-transfer"
-CLANG_MODULE_CACHE_PATH="$run_dir/module-cache" "$run_dir/scripts/build_converter.sh" "$converter" >/dev/null
 CLANG_MODULE_CACHE_PATH="$run_dir/module-cache" "$run_dir/scripts/build_sender.sh" "$sender" >/dev/null
 
 if [[ "$mode" == "list" ]]; then
   "$sender" --list
+  exit 0
+fi
+if [[ "$mode" == "pair" ]]; then
+  "$sender" --pair --id "$device_id"
   exit 0
 fi
 if [[ "$mode" == "probe" ]]; then
@@ -74,6 +81,8 @@ if [[ "$mode" == "probe" ]]; then
   exit 0
 fi
 
+converter="$run_dir/image-to-payload"
+CLANG_MODULE_CACHE_PATH="$run_dir/module-cache" "$run_dir/scripts/build_converter.sh" "$converter" >/dev/null
 input_copy="$run_dir/input-source"
 cp "$input_path" "$input_copy"
 normalized_image="$run_dir/input-normalized.png"
@@ -84,7 +93,7 @@ else
 fi
 
 payload_prefix="$run_dir/image"
-"$converter" --input "$normalized_image" --target t3 --orientation "$screen_orientation" --output-prefix "$payload_prefix"
+"$converter" --input "$normalized_image" --target t3 --orientation todoocard-correct --output-prefix "$payload_prefix"
 python3 "$run_dir/scripts/validate_payload.py" "$payload_prefix.protocol.qlz"
 echo "Prepared payload: $payload_prefix.protocol.qlz"
 
