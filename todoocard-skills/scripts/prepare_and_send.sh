@@ -94,10 +94,23 @@ fi
 
 payload_prefix="$run_dir/image"
 "$converter" --input "$normalized_image" --target t3 --orientation todoocard-correct --output-prefix "$payload_prefix"
-python3 "$run_dir/scripts/validate_payload.py" "$payload_prefix.protocol.qlz"
-echo "Prepared payload: $payload_prefix.protocol.qlz"
+python3 "$run_dir/scripts/quicklz_payload.py" \
+  --input "$payload_prefix.controller.bin" \
+  --output "$payload_prefix.protocol.qlz"
+python3 "$run_dir/scripts/validate_payload.py" \
+  --expected-raw "$payload_prefix.controller.bin" \
+  "$payload_prefix.controller.bin" \
+  "$payload_prefix.protocol.qlz" \
+  "$payload_prefix.protocol.legacy.qlz"
+echo "Prepared v157+ payload: $payload_prefix.protocol.qlz"
+echo "Prepared legacy payload: $payload_prefix.protocol.legacy.qlz"
 
 if [[ "$mode" == "send" ]]; then
   echo "Sending to device $device_id ..."
-  "$sender" --payload "$payload_prefix.protocol.qlz" --compressed --id "$device_id"
+  "$sender" \
+    --payload "$payload_prefix.protocol.qlz" \
+    --legacy-payload "$payload_prefix.protocol.legacy.qlz" \
+    --raw-payload "$payload_prefix.controller.bin" \
+    --compressed \
+    --id "$device_id"
 fi

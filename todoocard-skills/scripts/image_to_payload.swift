@@ -68,7 +68,8 @@ private func usage() -> Never {
 
     Outputs:
       <prefix>.bin
-      <prefix>.protocol.qlz for t3
+      <prefix>.controller.bin for t3
+      <prefix>.protocol.legacy.qlz for pre-v157 T3 firmware
     """)
     Foundation.exit(64)
 }
@@ -333,10 +334,14 @@ do {
 
     if target.isT3 {
         let controllerRaw = rotatedClockwiseMirroredForSE0368(bitmap, size: size)
-        let protocolPayload = try quickLZStoredPayload(from: controllerRaw)
-        let qlzURL = URL(fileURLWithPath: outputPrefix + ".protocol.qlz")
-        try protocolPayload.write(to: qlzURL)
-        log("Wrote \(qlzURL.path) (\(protocolPayload.count) bytes)")
+        let controllerURL = URL(fileURLWithPath: outputPrefix + ".controller.bin")
+        try controllerRaw.write(to: controllerURL)
+        log("Wrote \(controllerURL.path) (\(controllerRaw.count) bytes)")
+
+        let legacyProtocolPayload = try quickLZStoredPayload(from: controllerRaw)
+        let legacyURL = URL(fileURLWithPath: outputPrefix + ".protocol.legacy.qlz")
+        try legacyProtocolPayload.write(to: legacyURL)
+        log("Wrote \(legacyURL.path) (\(legacyProtocolPayload.count) bytes)")
     }
 } catch {
     log("Failed: \(error.localizedDescription)")
